@@ -15,6 +15,8 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::config::{MAX_SYSCALL_NUM, PAGE_SIZE};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +135,64 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Record one syscall made by the current task.
+    fn increment_current_syscall(&self, syscall_id: usize) {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] =
+            inner.tasks[current].syscall_times[syscall_id].saturating_add(1);
+    }
+
+    /// Return the current task's count for a syscall number.
+    fn current_syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return None;
+        }
+        let inner = self.inner.exclusive_access();
+        Some(inner.tasks[inner.current_task].syscall_times[syscall_id])
+    }
+
+    /// Map a new range in the current task's address space.
+    fn map_current(&self, start: usize, len: usize, permission: MapPermission) -> bool {
+        const USER_VA_MAX: usize = 1usize << 38;
+        if len == 0 || start % PAGE_SIZE != 0 {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if end > USER_VA_MAX {
+            return false;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current]
+            .memory_set
+            .map_user_range(VirtAddr::from(start), VirtAddr::from(end), permission)
+    }
+
+    /// Unmap a range in the current task's address space.
+    fn unmap_current(&self, start: usize, len: usize) -> bool {
+        const USER_VA_MAX: usize = 1usize << 38;
+        if len == 0 || start % PAGE_SIZE != 0 {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if end > USER_VA_MAX {
+            return false;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current]
+            .memory_set
+            .unmap_user_range(VirtAddr::from(start), VirtAddr::from(end))
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +261,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Record one syscall made by the current task.
+pub fn increment_current_syscall(syscall_id: usize) {
+    TASK_MANAGER.increment_current_syscall(syscall_id);
+}
+
+/// Get the current task's count for a syscall number.
+pub fn current_syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.current_syscall_count(syscall_id)
+}
+
+/// Map a new range in the current task's address space.
+pub fn map_current(start: usize, len: usize, permission: MapPermission) -> bool {
+    TASK_MANAGER.map_current(start, len, permission)
+}
+
+/// Unmap a range in the current task's address space.
+pub fn unmap_current(start: usize, len: usize) -> bool {
+    TASK_MANAGER.unmap_current(start, len)
 }

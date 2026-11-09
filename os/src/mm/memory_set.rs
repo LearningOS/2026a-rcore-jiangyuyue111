@@ -233,6 +233,52 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+
+    /// Map a page-aligned, currently unused user range with framed pages.
+    pub fn map_user_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self.translate(vpn).is_some_and(|pte| pte.is_valid()) {
+                return false;
+            }
+        }
+        self.insert_framed_area(start, end, permission | MapPermission::U);
+        true
+    }
+
+    /// Unmap every page in a page-aligned user range.
+    pub fn unmap_user_range(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if !self.translate(vpn).is_some_and(|pte| pte.is_valid()) {
+                return false;
+            }
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|area| area.data_frames.contains_key(&vpn))
+            else {
+                return false;
+            };
+            area.unmap_one(&mut self.page_table, vpn);
+        }
+        true
+    }
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
