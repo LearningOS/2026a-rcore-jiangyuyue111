@@ -1,12 +1,18 @@
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
+        PageTable, VirtAddr,
+    },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::mem::size_of;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -146,17 +152,46 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     }
 }
 
-/// get_time syscall
-///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// Write the current time to a possibly cross-page user buffer.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let page_table = PageTable::from_token(token);
+    let len = size_of::<TimeVal>();
+    let mut start = ts as usize;
+    let Some(end) = start.checked_add(len) else {
+        return -1;
+    };
+    while start < end {
+        let va = VirtAddr::from(start);
+        if usize::from(va) != start {
+            return -1;
+        }
+        match page_table.translate(va.floor()) {
+            Some(pte)
+                if pte.is_valid()
+                    && pte.writable()
+                    && pte.flags().bits() & MapPermission::U.bits() != 0 => {}
+            _ => return -1,
+        }
+        start += (PAGE_SIZE - va.page_offset()).min(end - start);
+    }
+    let us = get_time_us();
+    let time = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let bytes = unsafe { core::slice::from_raw_parts((&time as *const TimeVal).cast::<u8>(), len) };
+    let mut offset = 0;
+    for buffer in translated_byte_buffer(token, ts.cast::<u8>(), len) {
+        let next = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..next]);
+        offset = next;
+    }
+    0
 }
 
 /// mmap syscall
