@@ -284,6 +284,78 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Map a previously unused user virtual-address range with framed pages.
+    pub fn map_user_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self.translate(vpn).is_some_and(|pte| pte.is_valid()) {
+                return false;
+            }
+        }
+        self.insert_framed_area(start, end, permission | MapPermission::U);
+        true
+    }
+
+    /// Unmap a complete user range, leaving it unchanged if any page is absent.
+    pub fn unmap_user_range(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if !self.translate(vpn).is_some_and(|pte| pte.is_valid()) {
+                return false;
+            }
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|area| area.data_frames.contains_key(&vpn))
+            else {
+                return false;
+            };
+            area.unmap_one(&mut self.page_table, vpn);
+        }
+        true
+    }
+
+    /// Copy bytes into user memory after validating the complete destination.
+    pub fn copy_to_user(&mut self, dst: usize, src: &[u8]) -> bool {
+        let Some(end) = dst.checked_add(src.len()) else {
+            return false;
+        };
+        for va in dst..end {
+            let va = VirtAddr::from(va);
+            let Some(pte) = self.page_table.translate(va.floor()) else {
+                return false;
+            };
+            let flags = pte.flags();
+            if !pte.is_valid()
+                || !flags.contains(PTEFlags::U)
+                || !flags.contains(PTEFlags::W)
+            {
+                return false;
+            }
+        }
+        for (offset, byte) in src.iter().enumerate() {
+            let va = VirtAddr::from(dst + offset);
+            let pte = self.page_table.translate(va.floor()).unwrap();
+            pte.ppn().get_bytes_array()[va.page_offset()] = *byte;
+        }
+        true
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
